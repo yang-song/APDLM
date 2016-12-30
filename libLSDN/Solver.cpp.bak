@@ -1,0 +1,610 @@
+#include <iostream>
+#include <fstream>
+#include <numeric>
+
+#include "cuda_runtime.h"
+
+#include "Solver.h"
+#include "../CPrecisionTimer.h"
+
+#ifdef WITH_MPI
+#include "mpi.h"
+#endif
+
+#define LSDN_USE_THREADS
+
+template <class C>
+Solver<C>::Solver(SolverParameters& params) : NumberStepSizeReductions(0), ReductionAttempt(params.InitReductionAttempts), params(&params) {}
+
+template <class C>
+Solver<C>::~Solver() {}
+
+template <class C>
+void Solver<C>::LoadWeights(CostFunType* CF) {
+	if (CF->ClusterID == 0) {
+		std::cout << "Weight vector dimension: " << CF->GetParamPtr()->GetWeightDimension() << std::endl;
+	}
+	if (params->InitWeights != NULL) {
+		std::vector<ValueType> weights(CF->GetParamPtr()->GetWeightDimension(), ValueType(0.0));
+		std::ifstream ifs(params->InitWeights, std::ios_base::binary | std::ios_base::in | std::ios_base::ate);
+		if (ifs.is_open()) {
+			std::ifstream::pos_type FileSize = ifs.tellg();
+			ifs.seekg(0, std::ios_base::beg);
+			if (size_t(FileSize) == weights.size()*sizeof(ValueType)) {
+				ifs.read((char*)&weights[0], weights.size()*sizeof(ValueType));
+			} else {
+				std::cout << "Dimensions of initial weight file (" << FileSize / sizeof(ValueType) << ") don't match parameter dimension (" << weights.size() << ")." << std::endl;
+				std::vector<ValueType>().swap(weights);
+			}
+			ifs.close();
+			if (weights.size() > 0) {
+				CF->SetWeights(&weights);
+			}
+		} else {
+			std::cout << "Could not open weight file '" << params->InitWeights << "'" << std::endl;
+		}
+	}
+}
+
+template <class C>
+void Solver<C>::CheckDerivative(CostFunType* Train, std::vector<ValueType>* weights, ValueType h) {
+	Train->CreateData(NULL);
+	Train->PrepareComputation();
+
+	std::vector<ValueType>* ourWeights;
+	if (weights != NULL) {
+		Train->SetWeights(weights);
+		ourWeights = weights;
+	} else {
+		ourWeights = new std::vector<ValueType>(*Train->GetWeights());
+	}
+
+	GradientComputation(0, Train, true);
+
+	std::vector<ValueType> ComputedDerivative;
+	Train->GetParamPtr()->GetDerivative(typename NodeType::GPUType(), ComputedDerivative);
+
+	std::vector<ValueType> ApproximatedDerivative(ComputedDerivative.size(), ValueType(0.0));
+	ValueType norm = ValueType(0.0);
+	ValueType maxAbsDiff = ValueType(0.0);
+	size_t maxDiffDim = 0;
+	for (size_t k = 0; k < ApproximatedDerivative.size(); ++k) {
+		ValueType origWeight = (*ourWeights)[k];
+		(*ourWeights)[k] += h;
+		Train->SetWeights(ourWeights);
+		ValueType f1 = GradientComputation(int(k), Train, false);
+		(*ourWeights)[k] = origWeight - h;
+		Train->SetWeights(ourWeights);
+		ValueType f2 = GradientComputation(int(k), Train, false);
+		(*ourWeights)[k] = origWeight;
+
+		ApproximatedDerivative[k] = (f1 - f2) / (2 * h);
+		
+		ValueType diff = ComputedDerivative[k] - ApproximatedDerivative[k];
+		norm += (diff)*(diff);
+		if (fabs(diff) > maxAbsDiff) {
+			maxAbsDiff = fabs(diff);
+			maxDiffDim = k;
+		}
+
+	}
+	
+	std::cout << "Norm of deriv diff:           " << std::sqrt(norm) << std::endl;
+	std::cout << "Max abs value deriv diff:     " << maxAbsDiff << std::endl;
+	std::cout << "Max abs value deriv diff dim: " << maxDiffDim << std::endl;
+
+	if (weights == NULL) {
+		delete ourWeights;
+	}
+}
+
+template <class C>
+int Solver<C>::Iterate(CostFunType* Train, CostFunType* Valid) {
+	Train->CreateData(NULL);
+	Train->PrepareComputation();
+
+	LoadWeights(Train);
+	
+	bool MoreValidationDataToLoad = true;
+	if (Valid != NULL) {
+		MoreValidationDataToLoad = Valid->CreateData(Train->GetParamPtr());
+		Valid->PrepareComputation();
+	}
+
+	int ValidationInterval = params->ValidationInterval;
+
+	std::vector<ValueType> loss(params->AveragingSize, ValueType(0.0));
+	CPrecisionTimer CTmr, CTmrLocal;
+	CTmr.Start();
+	for (int iter = 0; iter < params->Iterations; ++iter) {
+		CTmrLocal.Start();
+#ifdef LSDN_USE_THREADS
+		Train->StartPrefetchThread(iter);
+#else
+		Train->PrefetchData(iter);
+#endif
+
+		ValueType primal = GradientComputation(iter, Train, true);
+
+		/*std::vector<ValueType> ComputedDerivative;
+		Train->GetParamPtr()->GetDerivative(typename NodeType::GPUType(), ComputedDerivative);
+		{
+			std::ofstream ofs("ParameterDerivative.dat", std::ios_base::binary | std::ios_base::out);
+			ofs.write((char*)&ComputedDerivative[0], ComputedDerivative.size()*sizeof(ValueType));
+			ofs.close();
+		}*/
+
+
+		if (Train->ClusterSize>1 && Train->ClusterID == 0 && iter%params->PrintFrequency == 0) {
+			std::cout << " .";
+			std::cout.flush();
+		}
+		GradientUpdateAndReset(Train);
+
+		/*if((iter+1)%1==0) {
+			char fnSnapshot[101];
+			sprintf(fnSnapshot, "Snapshot.%d.dat", iter);
+			std::vector<ValueType>* result = Train->GetWeights();
+			std::ofstream ofs(fnSnapshot, std::ios_base::binary | std::ios_base::out);
+			ofs.write((char*)&(*result)[0], result->size()*sizeof(ValueType));
+			ofs.close();
+		}*/
+
+		if (Train->ClusterID == 0 && iter%params->PrintFrequency == 0) {
+			std::cout << " T: ";
+			std::cout.flush();
+		}
+
+#ifdef LSDN_USE_THREADS
+		Train->JoinThread();
+#endif
+
+		Train->SwapData(iter);
+
+		if (Train->ClusterID == 0 && iter%params->PrintFrequency == 0) {
+			std::cout << CTmrLocal.Stop() << std::endl;
+		}
+
+		if (Valid != NULL && (iter + 1) % ValidationInterval == 0) {
+			CTmrLocal.Start();
+			bool ValidationDataAvailable = true;
+			int ValidationCounter = 0;
+			size_t CurrentPosition = ((iter + 1) / ValidationInterval - 1) % loss.size();
+			loss[CurrentPosition] = ValueType(0.0);
+			while (ValidationDataAvailable && MoreValidationDataToLoad) {
+#ifdef LSDN_USE_THREADS
+				Valid->StartPrefetchThread(ValidationCounter++);
+#else
+				ValidationDataAvailable = Valid->PrefetchData(ValidationCounter++);
+#endif
+				
+				loss[CurrentPosition] += ComputeLoss(Valid);
+#ifdef LSDN_USE_THREADS
+				ValidationDataAvailable = Valid->JoinThread();
+#endif
+
+				Valid->SwapData(-1);
+			}
+			if (MoreValidationDataToLoad) {
+#ifdef LSDN_USE_THREADS
+				Valid->StartPrefetchThread(ValidationCounter++);
+#else
+				ValidationDataAvailable = Valid->PrefetchData(ValidationCounter++);
+#endif
+			}
+			loss[CurrentPosition] += ComputeLoss(Valid);
+			if (MoreValidationDataToLoad) {
+#ifdef LSDN_USE_THREADS
+				ValidationDataAvailable = Valid->JoinThread();
+#endif
+				Valid->SwapData(-1);
+			}
+
+#ifdef WITH_MPI
+			if (Valid->ClusterSize > 1) {
+				ValueType tmp_buffer = loss[CurrentPosition];
+				if (sizeof(ValueType) == 4) {
+					MPI::COMM_WORLD.Allreduce(&tmp_buffer, &loss[CurrentPosition], 1, MPI::FLOAT, MPI::SUM);
+				} else if (sizeof(ValueType) == 8) {
+					MPI::COMM_WORLD.Allreduce(&tmp_buffer, &loss[CurrentPosition], 1, MPI::DOUBLE, MPI::SUM);
+				} else {
+					assert(false);
+				}
+			}
+#endif
+			if (Valid->ClusterID == 0) {
+				std::cout << "Loss: " << loss[CurrentPosition] << " T: " << CTmrLocal.Stop() << std::endl;
+			}
+
+			if ((iter + 1) / ValidationInterval > int(loss.size() - 1) && ((iter + 1) % params->ReductionCheckInterval)==0 && ReduceStepSize(loss, CurrentPosition, (Valid->ClusterID==0))) {
+				if (Valid->ClusterID == 0) {
+					std::cout << "Reducing stepsize..." << std::endl;
+				}
+				Train->ReduceStepSize();
+			}
+		} else if (Valid == NULL && (iter + 1) % ValidationInterval == 0) {
+			size_t CurrentPosition = ((iter + 1) / ValidationInterval - 1) % loss.size();
+			loss[CurrentPosition] = primal;
+			if ((iter + 1) / ValidationInterval > int(loss.size() - 1) && ((iter + 1) % params->ReductionCheckInterval) == 0 && ReduceStepSize(loss, CurrentPosition, (Train->ClusterID == 0))) {
+				if (Train->ClusterID == 0) {
+					std::cout << "Reducing stepsize..." << std::endl;
+				}
+				Train->ReduceStepSize();
+			}
+		}
+	}
+	std::cout << "Time for optimization: " << CTmr.Stop() << std::endl;
+	return 0;
+}
+
+template <class C>
+int Solver<C>::Predict(CostFunType* Test, std::vector<ValueType>* weights, std::vector<ValueType>& Scores, std::vector<std::map<size_t, std::vector<ValueType> > >& Beliefs) {
+	bool TestDataAvailable = Test->CreateData(NULL);
+	Test->PrepareComputation();
+	Test->SetWeights(weights);
+
+	int count = 0;
+	CPrecisionTimer CTmr;
+	CTmr.Start();
+	while (TestDataAvailable) {
+#ifdef LSDN_USE_THREADS
+		Test->StartPrefetchThread(count++);
+#else
+		TestDataAvailable = Test->PrefetchData(count++);
+#endif
+
+		ComputePrediction(Test, Scores, Beliefs);
+#ifdef LSDN_USE_THREADS
+		TestDataAvailable = Test->JoinThread();
+#endif
+		Test->SwapData(-1);
+	}
+	ComputePrediction(Test, Scores, Beliefs);
+	std::cout << "Time for prediction: " << CTmr.Stop() << std::endl;
+	return 0;
+}
+
+template <class C>
+typename Solver<C>::ValueType Solver<C>::GradientComputation(int iter, CostFunType* Train, bool WithBackwardPass) {
+	if (Train->ClusterID == 0 && iter%params->PrintFrequency == 0) {
+		std::cout << "I: " << iter;
+		std::cout.flush();
+	}
+
+	typename C::CFData* CF = Train->GetCF();
+	for (typename std::vector<CompTree*>::const_iterator it = CF->CompTreeSet->begin(), it_e = CF->CompTreeSet->end(); it != it_e; ++it) {
+		(*it)->ForwardPass(TRAIN);
+	}
+	Train->CopyRootFunctionValues(typename NodeType::GPUType());
+	Train->CopyRootParameterValues(typename NodeType::GPUType());
+	Train->CopyRootDataValues(typename NodeType::GPUType());
+
+	//compute first part of primal, i.e., \bar F(w)
+	ValueType primal = ValueType(0.0);
+	typename std::vector<std::map<size_t, std::vector<typename NodeType::ValueType> > >::const_iterator x_obs = CF->obs->begin();
+	for (typename std::vector<GraphType>::const_iterator x = CF->graph->begin(), x_e = CF->graph->end(); x != x_e; ++x, ++x_obs) {
+		for (typename std::vector<typename SolverType::GraphNode*>::const_iterator rit = x->begin(), rit_e = x->end(); rit != rit_e; ++rit) {
+			typename SolverType::GraphNode* r = *rit;
+
+			if (x_obs->find(r->flag) == x_obs->end()) {
+				size_t numVars = r->num_variables;
+				size_t numEL = r->cum_num_states[numVars];
+
+				for (size_t x_r = 0; x_r != numEL; ++x_r) {
+					ValueType obsBel = 1.0;
+
+					for (size_t varIX = 0; varIX < numVars; ++varIX) {
+						size_t variableState = (x_r / r->cum_num_states[varIX]) % r->num_states[varIX];
+						obsBel *= x_obs->at(r->var_ix[varIX])[variableState];
+					}
+
+					primal -= obsBel * (*r->pot)(x_r, r->AccessOffset, r->Stride);
+				}
+			} else {
+				size_t numVars = r->num_variables;
+				size_t numEL = r->cum_num_states[numVars];
+				const std::vector<ValueType>& obsBel = x_obs->at(r->flag);
+				for (size_t x_r = 0; x_r != numEL; ++x_r) {
+					primal -= obsBel[x_r] * (*r->pot)(x_r, r->AccessOffset, r->Stride);
+				}
+			}
+		}
+	}
+
+	size_t k_e = CF->graph->size();
+	std::vector<std::map<size_t, std::vector<typename NodeType::ValueType> > > Beliefs(CF->graph->size(), std::map<size_t, std::vector<typename NodeType::ValueType> >());
+	ValueType local_primal = ValueType(0);
+	ValueType lossValue = ValueType(0);
+
+#pragma omp parallel for reduction(+:local_primal, lossValue)
+	for (size_t k = 0; k < k_e; ++k) {
+		SolverType MP(&CF->graph->at(k), 1.0);
+		MP.RunMP(params->MPIterations, typename NodeType::ValueType(0.0), 2, 0);
+		/*ValueType MP_primal = ValueType(0.0);
+		ValueType MP_primalAgree = ValueType(0.0);
+		ValueType MP_EntropySum = ValueType(0.0);
+		MP.ComputePrimalWithAgreement(&MP_primal, &MP_primalAgree, &MP_EntropySum);
+		primal += MP_primalAgree;*/
+		local_primal += MP.ComputeDual();
+		MP.GetResult(Beliefs[k]);
+
+		std::map<size_t, std::vector<typename NodeType::ValueType> >& bel = Beliefs[k];
+		for (typename std::map<size_t, std::vector<ValueType> >::const_iterator rit = CF->obs->at(k).begin(), rit_e = CF->obs->at(k).end(); rit != rit_e; ++rit) {
+			const std::vector<ValueType>& obsBel = bel[rit->first];
+
+			//max marginal
+			if (!params->Top5Loss) {
+				size_t numEL = obsBel.size();
+				size_t x_max = 0;
+				for (size_t x_r = 1; x_r != numEL; ++x_r) {
+					if (obsBel[x_r] > obsBel[x_max]) {
+						x_max = x_r;
+					}
+				}
+				lossValue += (ValueType(1) - rit->second[x_max]);
+			} else {
+				//top5 loss
+				std::vector<size_t> idx(obsBel.size(), 0);
+				for (size_t ix = 0; ix < idx.size(); ++ix) {
+					idx[ix] = ix;
+				}
+				std::nth_element(idx.begin(), idx.begin() + 4, idx.end(), [&obsBel](size_t ix1, size_t ix2) { return obsBel[ix1] > obsBel[ix2]; });
+				const std::vector<ValueType>& tmp = rit->second;
+				size_t maxIX = *std::max_element(idx.begin(), idx.begin() + 5, [&tmp](size_t ix1, size_t ix2) { return tmp[ix1] < tmp[ix2]; });
+				lossValue += (ValueType(1) - tmp[maxIX]);//1 - observation = loss
+			}
+		}
+	}
+	primal += local_primal;
+#ifdef WITH_MPI
+	if (Train->ClusterSize>1) {
+		ValueType tmp_buffer[2]{primal, lossValue};
+		ValueType recv_buffer[2];
+		if (sizeof(ValueType) == 4) {
+			MPI::COMM_WORLD.Allreduce(&tmp_buffer, &recv_buffer, 2, MPI::FLOAT, MPI::SUM);
+		} else if (sizeof(ValueType) == 8) {
+			MPI::COMM_WORLD.Allreduce(&tmp_buffer, &recv_buffer, 2, MPI::DOUBLE, MPI::SUM);
+		} else {
+			assert(false);
+		}
+		primal = recv_buffer[0];
+		lossValue = recv_buffer[1];
+	}
+#endif
+	primal += Train->GetRegularization();
+	if (Train->ClusterID == 0 && iter%params->PrintFrequency == 0) {
+		std::cout << " P: " << primal << " L: " << lossValue << " R: " << ReductionAttempt;
+		std::cout.flush();
+	}
+
+	/*{
+		std::ofstream ofs("OutputBeliefs.dat", std::ios_base::binary | std::ios_base::out);
+		for (typename std::vector<std::map<size_t, std::vector<ValueType> > >::iterator x = Beliefs.begin(), x_e = Beliefs.end(); x != x_e; ++x) {
+			for (typename std::map<size_t, std::vector<ValueType> >::iterator x_bel = x->begin(), x_bel_e = x->end(); x_bel != x_bel_e; ++x_bel) {
+				ofs.write((char*)&x_bel->second[0], x_bel->second.size()*sizeof(ValueType));
+			}
+		}
+		ofs.close();
+	}*/
+
+	if (WithBackwardPass) {
+		typename std::vector<std::map<size_t, std::vector<typename NodeType::ValueType> > >::iterator curBel = Beliefs.begin();
+		x_obs = CF->obs->begin();
+		for (typename std::vector<GraphType>::const_iterator x = CF->graph->begin(), x_e = CF->graph->end(); x != x_e; ++x, ++curBel, ++x_obs) {
+			for (typename std::vector<typename SolverType::GraphNode*>::const_iterator rit = x->begin(), rit_e = x->end(); rit != rit_e; ++rit) {
+				typename SolverType::GraphNode* r = *rit;
+				size_t numVars = r->num_variables;
+				size_t numEL = r->cum_num_states[numVars];
+
+				NodeType* ct = r->pot->GetRoot();
+				ValueType* targetMem = ct->GetCPUDerivativeRootPtr();
+				std::vector<ValueType>& CB = curBel->at(r->flag);
+
+				if (x_obs->find(r->flag) == x_obs->end()) {
+					for (size_t x_r = 0; x_r != numEL; ++x_r) {
+						ValueType obsBel = 1.0;
+
+						for (size_t varIX = 0; varIX < numVars; ++varIX) {
+							size_t variableState = (x_r / r->cum_num_states[varIX]) % r->num_states[varIX];
+							obsBel *= x_obs->at(r->var_ix[varIX])[variableState];
+						}
+
+						targetMem[x_r*r->Stride + r->AccessOffset] += (CB[x_r] - obsBel);
+					}
+				} else {
+					const ValueType* obsMem = &x_obs->at(r->flag)[0];
+					for (size_t x_r = 0; x_r != numEL; ++x_r) {
+						targetMem[x_r*r->Stride + r->AccessOffset] += (CB[x_r] - obsMem[x_r]);
+					}
+				}
+			}
+		}
+		Train->CopyRootFunctionDerivatives(typename NodeType::GPUType());
+		Train->CopyRootParameterDerivatives(typename NodeType::GPUType());
+
+		for (typename std::vector<CompTree*>::const_iterator it = CF->CompTreeSet->begin(), it_e = CF->CompTreeSet->end(); it != it_e; ++it) {
+			(*it)->BackwardPass();
+		}
+	}
+
+	return (params->LossForAveraging==1) ? lossValue : primal;
+}
+
+template <class C>
+void Solver<C>::GradientUpdateAndReset(CostFunType* Train) {
+	Train->Update();
+	//std::cout << "No Update..." << std::endl;
+
+	//ParamCont.UpdateHistory(typename NodeType::GPUType());
+
+	Train->ResetGradient(typename NodeType::GPUType());
+	Train->ResetCPURootParameterDerivative(typename NodeType::GPUType());
+	Train->ResetCPURootFunctionDerivative(typename NodeType::GPUType());
+}
+
+template <class C>
+typename C::ValueType Solver<C>::ComputeLoss(CostFunType* Valid) {
+	ValueType lossValue = ValueType(0.0);
+	typename C::CFData* CF = Valid->GetCF();
+
+	//forward pass over all unique CompTrees
+	for (typename std::vector<CompTree*>::const_iterator it = CF->CompTreeSet->begin(), it_e = CF->CompTreeSet->end(); it != it_e; ++it) {
+		(*it)->ForwardPass(VALIDATE);
+	}
+	Valid->CopyRootFunctionValues(typename NodeType::GPUType());
+	Valid->CopyRootParameterValues(typename NodeType::GPUType());
+	Valid->CopyRootDataValues(typename NodeType::GPUType());
+
+	//message passing (can be done in parallel over samples)
+	size_t k_e = CF->graph->size();
+	//std::vector<std::map<size_t, std::vector<ValueType> > > GlobalBeliefs(k_e, std::map<size_t, std::vector<ValueType> >());
+
+#pragma omp parallel for reduction(+:lossValue)
+	for (size_t k = 0; k < k_e; ++k) {
+		SolverType MP(&CF->graph->at(k), 1.0);
+		MP.RunMP(params->ValidationMPIterations, typename NodeType::ValueType(0.0), 2, 0);
+		/*ValueType MP_primal = ValueType(0.0);
+		ValueType MP_primalAgree = ValueType(0.0);
+		ValueType MP_EntropySum = ValueType(0.0);
+		MP.ComputePrimalWithAgreement(&MP_primal, &MP_primalAgree, &MP_EntropySum);
+		primal += MP_primalAgree;*/
+		//Scores[CurrentSize + k] -= MP.ComputeDual();
+		std::map<size_t, std::vector<ValueType> > Beliefs;
+		MP.GetResult(Beliefs);
+		//GlobalBeliefs[k] = Beliefs;
+
+		if (CF->loss != NULL) {
+			for (typename std::vector<typename SolverType::GraphNode*>::const_iterator rit = CF->loss->at(k).begin(), rit_e = CF->loss->at(k).end(); rit != rit_e; ++rit) {
+				typename SolverType::GraphNode* r = *rit;
+
+				size_t numVars = r->num_variables;
+				size_t numEL = r->cum_num_states[numVars];
+				const std::vector<ValueType>& obsBel = Beliefs[r->flag];
+				//marginalize
+				/*for (size_t x_r = 0; x_r != numEL; ++x_r) {
+				lossValue += obsBel[x_r] * (*r->pot)(x_r, r->AccessOffset, r->Stride);
+				}*/
+				//max marginal
+				if (!params->Top5Loss) {
+					size_t x_max = 0;
+					for (size_t x_r = 1; x_r != numEL; ++x_r) {
+						if (obsBel[x_r] > obsBel[x_max]) {
+							x_max = x_r;
+						}
+					}
+					lossValue += (*r->pot)(x_max, r->AccessOffset, r->Stride);
+				} else {
+					assert(false);
+				}
+			}
+		} else {
+			for (typename std::map<size_t, std::vector<ValueType> >::const_iterator rit = CF->obs->at(k).begin(), rit_e = CF->obs->at(k).end(); rit != rit_e; ++rit) {
+				const std::vector<ValueType>& obsBel = Beliefs[rit->first];
+
+				//max marginal
+				if (!params->Top5Loss) {
+					size_t numEL = obsBel.size();
+					size_t x_max = 0;
+					for (size_t x_r = 1; x_r != numEL; ++x_r) {
+						if (obsBel[x_r] > obsBel[x_max]) {
+							x_max = x_r;
+						}
+					}
+					lossValue += rit->second[x_max];//observation abused as loss in validation set
+				} else {
+					//top5 loss
+					std::vector<size_t> idx(obsBel.size(), 0);
+					//std::iota(idx.begin(), idx.end(), 0);
+					for (size_t ix = 0; ix < idx.size(); ++ix) {
+						idx[ix] = ix;
+					}
+					std::nth_element(idx.begin(), idx.begin() + 4, idx.end(), [&obsBel](size_t ix1, size_t ix2) { return obsBel[ix1] > obsBel[ix2]; });
+					const std::vector<ValueType>& tmp = rit->second;
+					size_t minIX = *std::min_element(idx.begin(), idx.begin() + 5, [&tmp](size_t ix1, size_t ix2) { return tmp[ix1] < tmp[ix2]; });
+					lossValue += tmp[minIX];//observation abused as loss in validation set
+				}
+			}
+		}
+	}
+
+	return lossValue;
+}
+
+template <class C>
+int Solver<C>::ComputePrediction(CostFunType* Test, std::vector<ValueType>& Scores, std::vector<std::map<size_t, std::vector<ValueType> > >& Beliefs) {
+	typename C::CFData* CF = Test->GetCF();
+
+	//forward pass over all unique CompTrees
+	for (typename std::vector<CompTree*>::const_iterator it = CF->CompTreeSet->begin(), it_e = CF->CompTreeSet->end(); it != it_e; ++it) {
+		(*it)->ForwardPass(TEST);
+	}
+	Test->CopyRootFunctionValues(typename NodeType::GPUType());
+	Test->CopyRootParameterValues(typename NodeType::GPUType());
+	Test->CopyRootDataValues(typename NodeType::GPUType());
+
+	size_t CurrentSize = Scores.size();
+
+	size_t k_e = CF->graph->size();
+	Beliefs.resize(CurrentSize + k_e, std::map<size_t, std::vector<typename NodeType::ValueType> >());
+	Scores.resize(CurrentSize + k_e, ValueType(0.0));
+#pragma omp parallel for
+	for (size_t k = 0; k < k_e; ++k) {
+		SolverType MP(&CF->graph->at(k), 1.0);
+		MP.RunMP(params->MPIterations, typename NodeType::ValueType(0.0), 2, 0);
+		/*ValueType MP_primal = ValueType(0.0);
+		ValueType MP_primalAgree = ValueType(0.0);
+		ValueType MP_EntropySum = ValueType(0.0);
+		MP.ComputePrimalWithAgreement(&MP_primal, &MP_primalAgree, &MP_EntropySum);
+		primal += MP_primalAgree;*/
+		Scores[CurrentSize + k] -= MP.ComputeDual();
+		MP.GetResult(Beliefs[CurrentSize + k]);
+
+		typename std::map<size_t, std::vector<typename NodeType::ValueType> >& x_obs = Beliefs[CurrentSize + k];
+		for (typename std::vector<typename SolverType::GraphNode*>::const_iterator rit = CF->graph->at(k).begin(), rit_e = CF->graph->at(k).end(); rit != rit_e; ++rit) {
+			typename SolverType::GraphNode* r = *rit;
+
+			size_t numVars = r->num_variables;
+			size_t numEL = r->cum_num_states[numVars];
+			const std::vector<ValueType>& obsBel = x_obs[r->flag];
+			for (size_t x_r = 0; x_r != numEL; ++x_r) {
+				Scores[CurrentSize + k] += obsBel[x_r] * (*r->pot)(x_r, r->AccessOffset, r->Stride);
+			}
+		}
+	}
+
+	return 0;
+}
+
+template <class C>
+bool Solver<C>::ReduceStepSize(std::vector<ValueType>& lossValues, size_t LastWritePosition, bool ProvideOutput) {
+	if (lossValues.size() > 1 && NumberStepSizeReductions<100) {
+		size_t sz1 = lossValues.size() / 2;
+		size_t sz2 = lossValues.size() - sz1;
+		ValueType sum1 = ValueType(0.0);
+		ValueType sum2 = ValueType(0.0);
+		for (size_t k = 0; k < sz1; ++k) {
+			sum1 += lossValues[(LastWritePosition + k + 1) % lossValues.size()];
+		}
+		for (size_t k = 0; k < sz2; ++k) {
+			sum2 += lossValues[(LastWritePosition + sz1 + 1 + k) % lossValues.size()];
+		}
+		if (ProvideOutput) {
+			std::cout << "Averages: " << sum1 / sz1 << " " << sum2 / sz2 << std::endl;
+		}
+		if (sum1 / sz1 < sum2 / sz2) {
+			if (ReductionAttempt == 0) {
+				++NumberStepSizeReductions;
+				ReductionAttempt = params->NormalReductionAttempts;
+				return true;
+			} else {
+				--ReductionAttempt;
+			}
+		}
+	}
+	return false;
+}
+
+template class Solver<CostFunction<double, int, false, false> >;
+template class Solver<CostFunction<double, int, true, false> >;
+template class Solver<CostFunction<float, int, false, false> >;
+template class Solver<CostFunction<float, int, true, false> >;

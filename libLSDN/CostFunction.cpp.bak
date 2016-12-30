@@ -1,0 +1,869 @@
+#include <iostream>
+#include <string.h>
+
+#include "CostFunction.h"
+
+#include "cuda_runtime.h"
+
+#include "../LSDN_CudaCommon.h"
+
+#ifdef WITH_MPI
+#include "mpi.h"
+#endif
+#ifdef _MSC_VER
+#include <Winsock2.h>
+#endif
+
+#define DEF_CUDA_FREE(x) \
+	if ((x) != NULL) { \
+		cudaFree((x)); \
+		(x) = NULL; \
+	}
+
+#define LOCAL_HOSTNAME_MAX 256
+int GetHostName(char ** hostnamePtr, size_t *hostnameLength) {
+	char * hostname = NULL;
+	size_t nHostname = LOCAL_HOSTNAME_MAX;
+
+	hostname = new char[nHostname];
+#ifndef _MSC_VER
+	gethostname(hostname, nHostname);
+#else
+	WSADATA wsaData;
+	WSAStartup(MAKEWORD(2, 2), &wsaData);
+	gethostname(hostname, nHostname);
+	WSACleanup();
+#endif
+
+	// Make sure hostname is \x00 terminated.
+	hostname[nHostname - 1] = 0x00;
+	*hostnameLength = strnlen(hostname, nHostname) + 1;
+	*hostnamePtr = hostname;
+	return 0;
+}
+
+#ifdef WITH_MPI
+static unsigned int Adler32(const void * buf, size_t buflength) {
+	const unsigned char * buffer = (const unsigned char *)buf;
+
+	unsigned int s1 = 1;
+	unsigned int s2 = 0;
+
+	for (size_t n = 0; n < buflength; n++) {
+		s1 = (s1 + buffer[n]) % 65521;
+		s2 = (s2 + s1) % 65521;
+	}
+
+	return (s2 << 16) | s1;
+}
+
+int NodeRankByHash(int* nodeRank, int* nodeSize, const char* hostname, const size_t hostnameLength) {
+	unsigned int checkSum = Adler32(hostname, hostnameLength);
+
+	int commRank = MPI::COMM_WORLD.Get_rank();
+	MPI::Intracomm nodeComm = MPI::COMM_WORLD.Split(checkSum, commRank);
+
+	*nodeRank = nodeComm.Get_rank();
+	*nodeSize = nodeComm.Get_size();
+
+	// Determine if collisions of the hashed hostname occured.
+
+	int nSend = LOCAL_HOSTNAME_MAX;
+	char *send = new char[nSend];
+	strncpy(send, hostname, nSend);
+
+	// Ensure terminating \x00 at the end, this may not be
+	// garanteed if if len(send) = nSend.
+	send[nSend - 1] = 0x00;
+
+	char *recv = new char[nSend * *nodeSize];
+	nodeComm.Allgather(send, nSend, MPI::CHAR, recv, nSend, MPI::CHAR);
+
+	char * neighbor = recv;
+	int localNodeRank = 0;
+
+	// recv contains now an array of hostnames from all MPI ranks of
+	// this communicator. They are sorted ascending by the MPI rank.
+	// Also if collisions occur these are handled here.
+
+	for (int i = 0; i < *nodeSize; ++i) {
+		if (strcmp(send, neighbor) == 0) {
+			if (i < *nodeRank) {
+				// Compared neighbors still have lower rank than we have.
+				++localNodeRank;
+			} else {
+				break;
+			}
+		} else {
+			// Collision of the hash.
+		}
+		neighbor += nSend;
+	}
+
+	if (*nodeRank != localNodeRank) {
+		std::cout << "[" << commRank << "] collisions occured during node rank determinaton: node rank: " << *nodeRank << ", local node rank: " << localNodeRank << ", host: " << send << std::endl;
+		*nodeRank = localNodeRank;
+	}
+
+	// Clean up.
+	delete[] send; send = NULL;
+	delete[] recv; recv = NULL;
+	nodeComm.Free();
+
+	return 0;
+}
+#endif
+
+template <typename V, typename S, bool G, bool P>
+CostFunction<V, S, G, P>::CostFunction() : ToBeFilled(&CFInstance[0]), isMyParamPtr(false), paramPtr(NULL), GPUDataValues(NULL), GPUFunctionValues(NULL), GPUFunctionDerivative(NULL), DoPrefetch(false), UserCopyRequest(false), purpose(TRAIN), ClusterSize(1), ClusterID(0), MachineLocalSize(1), MachineLocalID(0), IInitializedMPI(false) {
+	GetHostName(&hostnamePtr, &hostnameLength);
+#ifdef WITH_MPI
+	if (!MPI::Is_initialized()) {
+		MPI::Init();
+		IInitializedMPI = true;
+	}
+	ClusterSize = MPI::COMM_WORLD.Get_size();
+	ClusterID = MPI::COMM_WORLD.Get_rank();
+	NodeRankByHash(&MachineLocalID, &MachineLocalSize, hostnamePtr, hostnameLength);
+#endif
+}
+
+template <typename V, typename S, bool G, bool P>
+CostFunction<V, S, G, P>::~CostFunction() {
+	if (hostnamePtr != NULL) {
+		delete[] hostnamePtr;
+		hostnamePtr = NULL;
+	}
+#ifdef WITH_MPI
+	if (!MPI::Is_finalized() && IInitializedMPI) {
+		MPI::Finalize();
+	}
+#endif
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::Clear() {
+	ClearCF(0);
+	ClearCF(1);
+
+	if (paramPtr != NULL && isMyParamPtr) {
+		paramPtr->Clear();
+		delete paramPtr;
+		paramPtr = NULL;
+		isMyParamPtr = false;
+	}
+
+	DEF_CUDA_FREE(GPUDataValues)
+	DEF_CUDA_FREE(GPUFunctionValues)
+	DEF_CUDA_FREE(GPUFunctionDerivative)		
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ClearCF(int ix) {
+	if (CFInstance[ix].graph != NULL) {
+		ClearGraph(CFInstance[ix].graph);
+		delete CFInstance[ix].graph;
+		CFInstance[ix].graph = NULL;
+	}
+
+	if (CFInstance[ix].MessageContainer != NULL) {
+		delete CFInstance[ix].MessageContainer;
+		CFInstance[ix].MessageContainer = NULL;
+	}
+
+	if (CFInstance[ix].loss != NULL) {
+		ClearLoss(CFInstance[ix].loss);
+		delete CFInstance[ix].loss;
+		CFInstance[ix].loss = NULL;
+	}
+
+	if (CFInstance[ix].obs != NULL) {
+		delete CFInstance[ix].obs;
+		CFInstance[ix].obs = NULL;
+	}
+
+	if (CFInstance[ix].CPUDataValues != NULL) {
+		delete CFInstance[ix].CPUDataValues;
+		CFInstance[ix].CPUDataValues = NULL;
+	}
+
+	if (CFInstance[ix].CPUFunctionValues != NULL) {
+		delete CFInstance[ix].CPUFunctionValues;
+		CFInstance[ix].CPUFunctionValues = NULL;
+	}
+
+	if (CFInstance[ix].dataClasses != NULL) {
+		ClearTreeItems(CFInstance[ix].dataClasses);
+		delete CFInstance[ix].dataClasses;
+		CFInstance[ix].dataClasses = NULL;
+	}
+
+	if (CFInstance[ix].DataClassesRoot != NULL) {
+		delete CFInstance[ix].DataClassesRoot;
+		CFInstance[ix].DataClassesRoot = NULL;
+	}
+
+	if (CFInstance[ix].functionClasses != NULL) {
+		ClearTreeItems(CFInstance[ix].functionClasses);
+		delete CFInstance[ix].functionClasses;
+		CFInstance[ix].functionClasses = NULL;
+	}
+
+	if (CFInstance[ix].FunctionClassesRoot != NULL) {
+		delete CFInstance[ix].FunctionClassesRoot;
+		CFInstance[ix].FunctionClassesRoot = NULL;
+	}
+
+	if (CFInstance[ix].CompTreeSet != NULL) {
+		ClearComputationTree(CFInstance[ix].CompTreeSet);
+		delete CFInstance[ix].CompTreeSet;
+		CFInstance[ix].CompTreeSet = NULL;
+	}
+}
+
+template <typename V, typename S, bool G, bool P>
+bool CostFunction<V, S, G, P>::CreateData(ParameterContainer<V, S, G, P>*) {
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+bool CostFunction<V, S, G, P>::PrefetchDataUser(int, bool*) {
+	return false;
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ClearGraph(std::vector<GraphType>*) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ClearLoss(std::vector<GraphType>*) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ClearComputationTree(std::vector<CompTree*>* CompTreeSet) {
+	for (typename std::vector<CompTree*>::iterator it = CompTreeSet->begin(), it_e = CompTreeSet->end(); it != it_e; ++it) {
+		delete *it;
+	}
+	CompTreeSet->clear();
+}
+
+template <typename V, typename S, bool G, bool P> template <typename T>
+void CostFunction<V, S, G, P>::ClearTreeItems(std::vector<T*>* ItemContainer) {
+	for (typename std::vector<T*>::iterator it = ItemContainer->begin(), it_e = ItemContainer->end(); it != it_e; ++it) {
+		(*it)->DeletedByContainer();
+		(*it)->Clear();
+		delete *it;
+	}
+	ItemContainer->clear();
+}
+
+template void CostFunction<double, int, false, false>::ClearTreeItems(std::vector<Data<Node<double, int, false> >*>*);
+template void CostFunction<double, int, true, false>::ClearTreeItems(std::vector<Data<Node<double, int, true> >*>*);
+template void CostFunction<float, int, false, false>::ClearTreeItems(std::vector<Data<Node<float, int, false> >*>*);
+template void CostFunction<float, int, true, false>::ClearTreeItems(std::vector<Data<Node<float, int, true> >*>*);
+template void CostFunction<double, int, false, false>::ClearTreeItems(std::vector<ComputeFunction<Node<double, int, false> >*>*);
+template void CostFunction<double, int, true, false>::ClearTreeItems(std::vector<ComputeFunction<Node<double, int, true> >*>*);
+template void CostFunction<float, int, false, false>::ClearTreeItems(std::vector<ComputeFunction<Node<float, int, false> >*>*);
+template void CostFunction<float, int, true, false>::ClearTreeItems(std::vector<ComputeFunction<Node<float, int, true> >*>*);
+
+template <typename V, typename S, bool G, bool P>
+typename CostFunction<V, S, G, P>::CFData* CostFunction<V, S, G, P>::GetCF() {
+	return CFInstance;
+}
+
+template <typename V, typename S, bool G, bool P>
+bool CostFunction<V, S, G, P>::PrefetchData(int counter) {
+	DoPrefetch = true;
+	ToBeFilled = &CFInstance[1];
+	UserCopyRequest = false;
+	bool retVal = PrefetchDataUser(counter, &UserCopyRequest);
+	DoPrefetch = false;
+	return retVal;
+}
+
+template <typename V, typename S, bool G, bool P>
+int CostFunction<V, S, G, P>::SwapData(int counter) {
+	bool FlagNewData = false;
+	bool FlagNewFunction = false;
+	bool FlagNewGraph = false;
+	bool FlagNewMessages = false;
+
+	if (CFInstance[1].graph != NULL) {
+		ClearGraph(CFInstance[0].graph);
+		delete CFInstance[0].graph;
+		CFInstance[0].graph = CFInstance[1].graph;
+		CFInstance[1].graph = NULL;
+		FlagNewGraph = true;
+	}
+
+	if (CFInstance[1].MessageContainer != NULL) {
+		StoreMessages(counter);
+		std::vector<std::vector<ValueType> >().swap(*CFInstance[0].MessageContainer);
+		delete CFInstance[0].MessageContainer;
+		CFInstance[0].MessageContainer = CFInstance[1].MessageContainer;
+		CFInstance[1].MessageContainer = NULL;
+		FlagNewMessages = true;
+	}
+
+	if (CFInstance[1].loss != NULL) {
+		ClearLoss(CFInstance[0].loss);
+		delete CFInstance[0].loss;
+		CFInstance[0].loss = CFInstance[1].loss;
+		CFInstance[1].loss = NULL;
+	}
+
+	if (CFInstance[1].obs != NULL) {
+		CFInstance[0].obs->clear();
+		std::vector<std::map<size_t, std::vector<typename NodeType::ValueType> > >().swap(*CFInstance[0].obs);
+		delete CFInstance[0].obs;
+		CFInstance[0].obs = CFInstance[1].obs;
+		CFInstance[1].obs = NULL;
+	}
+
+	if (CFInstance[1].CPUDataValues != NULL) {
+		CFInstance[0].CPUDataValues->clear();
+		std::vector<ValueType>().swap(*CFInstance[0].CPUDataValues);
+		delete CFInstance[0].CPUDataValues;
+		CFInstance[0].CPUDataValues = CFInstance[1].CPUDataValues;
+		CFInstance[1].CPUDataValues = NULL;
+		FlagNewData = true;
+	}
+
+	if (CFInstance[1].CPUFunctionValues != NULL) {
+		delete CFInstance[0].CPUFunctionValues;
+		CFInstance[0].CPUFunctionValues = CFInstance[1].CPUFunctionValues;
+		CFInstance[1].CPUFunctionValues = NULL;
+		FlagNewFunction = true;
+	}
+
+	if (CFInstance[1].dataClasses != NULL) {
+		ClearTreeItems(CFInstance[0].dataClasses);
+		delete CFInstance[0].dataClasses;
+		CFInstance[0].dataClasses = CFInstance[1].dataClasses;
+		CFInstance[1].dataClasses = NULL;
+		FlagNewData = true;
+	}
+
+	if (CFInstance[1].DataClassesRoot != NULL) {
+		delete CFInstance[0].DataClassesRoot;
+		CFInstance[0].DataClassesRoot = CFInstance[1].DataClassesRoot;
+		CFInstance[1].DataClassesRoot = NULL;
+		FlagNewData = true;
+	}
+
+	if (CFInstance[1].functionClasses != NULL) {
+		ClearTreeItems(CFInstance[0].functionClasses);
+		delete CFInstance[0].functionClasses;
+		CFInstance[0].functionClasses = CFInstance[1].functionClasses;
+		CFInstance[1].functionClasses = NULL;
+		FlagNewFunction = true;
+	}
+
+	if (CFInstance[1].FunctionClassesRoot != NULL) {
+		delete CFInstance[0].FunctionClassesRoot;
+		CFInstance[0].FunctionClassesRoot = CFInstance[1].FunctionClassesRoot;
+		CFInstance[1].FunctionClassesRoot = NULL;
+		FlagNewFunction = true;
+	}
+
+	if (CFInstance[1].CompTreeSet != NULL) {
+		ClearComputationTree(CFInstance[0].CompTreeSet);
+		delete CFInstance[0].CompTreeSet;
+		CFInstance[0].CompTreeSet = CFInstance[1].CompTreeSet;
+		CFInstance[1].CompTreeSet = NULL;
+	}
+
+	if (FlagNewData || UserCopyRequest) {
+		ValueType* baseDataPtr = &(CFInstance[0].CPUDataValues->at(0));
+		CopyDataToGPU(typename NodeType::GPUType(), baseDataPtr, FlagNewData);
+		if (FlagNewData) {
+			AdjustComputationPointers(baseDataPtr, *CFInstance[0].dataClasses, *CFInstance[0].DataClassesRoot, &GPUDataValuesRootOffset);
+		}
+	}
+
+	if (FlagNewFunction) {
+		ValueType* baseFunctionPtr = &(CFInstance[0].CPUFunctionValues->at(0));
+		CreateGPUFunctionData(typename NodeType::GPUType(), baseFunctionPtr);
+		AdjustComputationPointers(baseFunctionPtr, *CFInstance[0].functionClasses, *CFInstance[0].FunctionClassesRoot, &GPUFunctionValuesRootOffset);
+
+		if (purpose == TRAIN) {
+			CreateCPUDerivativeMemoryForFunctions();
+			ValueType* baseFunctionDerivativePtr = &CPUFunctionDerivative[0];
+			CreateGPUDerivativeMemoryForFunctions(typename NodeType::GPUType(), baseFunctionDerivativePtr);
+			AdjustDerivativePointers(baseFunctionDerivativePtr, *CFInstance[0].functionClasses, *CFInstance[0].FunctionClassesRoot, &CPUFunctionDerivative[0] + ComputeRootFunctionOffset(typename NodeType::GPUType(), GPUFunctionValuesRootOffset));
+		}
+	}
+
+	if (!FlagNewGraph) {
+		AdjustAccessPotentials(CFInstance[0].graph, CFInstance[0].CompTreeSet);
+	}
+
+	if (FlagNewMessages && !FlagNewGraph) {
+		AdjustMessagePointers(CFInstance[0].graph, CFInstance[0].MessageContainer);
+	}
+
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::AdjustAccessPotentials(std::vector<GraphType>*, std::vector<CompTree*>*) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::AdjustMessagePointers(std::vector<GraphType>*, std::vector<std::vector<ValueType> >*) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::StoreMessages(int) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ReduceStepSize() {
+	paramPtr->ReduceStepSize();
+}
+
+template <typename V, typename S, bool G, bool P> template <class I>
+I* CostFunction<V, S, G, P>::AddParameter(SizeType* sz, SizeType numDim, const typename I::NodeParameters& params, bool isRoot, int paramID) {
+	assert(DoPrefetch == false);
+	assert(!(paramPtr != NULL && isMyParamPtr == false));
+	if (paramPtr == NULL) {
+		isMyParamPtr = true;
+		paramPtr = new ParameterContainer<V, S, G, P>;
+	}
+	I* retVal = paramPtr->AddParameter(sz, numDim, params, isRoot, paramID);
+	return retVal;
+}
+
+template <typename V, typename S, bool G, bool P> template <class I>
+I* CostFunction<V, S, G, P>::AddData(SizeType* sz, SizeType numDim, const typename I::NodeParameters& params, bool isRoot) {
+	I* retVal = new I(params);
+	retVal->SetValueSize(NULL, sz, numDim);
+	if (ToBeFilled->dataClasses == NULL) {
+		ToBeFilled->dataClasses = new std::vector<Data<NodeType>*>;
+	}
+	if (ToBeFilled->DataClassesRoot == NULL) {
+		ToBeFilled->DataClassesRoot = new std::vector<bool>;
+	}
+	ToBeFilled->dataClasses->push_back(retVal);
+	ToBeFilled->DataClassesRoot->push_back(isRoot);
+	return retVal;
+}
+
+template <typename V, typename S, bool G, bool P> template <class I>
+I* CostFunction<V, S, G, P>::AddFunction(SizeType* sz, SizeType numDim, const typename I::NodeParameters& params, bool isRoot) {
+	I* retVal = new I(params);
+	retVal->SetValueSize(NULL, sz, numDim);
+	if (ToBeFilled->functionClasses == NULL) {
+		ToBeFilled->functionClasses = new std::vector<ComputeFunction<NodeType>*>;
+	}
+	if (ToBeFilled->FunctionClassesRoot == NULL) {
+		ToBeFilled->FunctionClassesRoot = new std::vector<bool>;
+	}
+	ToBeFilled->functionClasses->push_back(retVal);
+	ToBeFilled->FunctionClassesRoot->push_back(isRoot);
+	return retVal;
+}
+
+template <typename V, typename S, bool G, bool P>
+int CostFunction<V, S, G, P>::AddComputationTree(CompTree* CNN) {
+	if (ToBeFilled->CompTreeSet == NULL) {
+		ToBeFilled->CompTreeSet = new std::vector<CompTree*>;
+	}
+	int position = int(ToBeFilled->CompTreeSet->size());
+	ToBeFilled->CompTreeSet->push_back(CNN);
+	return position;
+}
+
+template <typename V, typename S, bool G, bool P>
+typename std::vector<Data<typename CostFunction<V, S, G, P>::NodeType>*>* CostFunction<V, S, G, P>::GetComputeDataClasses() {
+	return CFInstance[0].dataClasses;
+}
+
+template <typename V, typename S, bool G, bool P>
+int CostFunction<V, S, G, P>::CreateCPUMemoryForData(i2t<true>) {
+	size_t numData = 0;
+	typename std::vector<Data<NodeType>*>* ToBeModified;
+	std::vector<bool>* ToBeModifiedRoot;
+	if (ToBeFilled->dataClasses != NULL) {
+		ToBeModified = ToBeFilled->dataClasses;
+		ToBeModifiedRoot = ToBeFilled->DataClassesRoot;
+	} else {
+		ToBeModified = CFInstance[0].dataClasses;
+		ToBeModifiedRoot = CFInstance[0].DataClassesRoot;
+	}
+	for (typename std::vector<Data<NodeType>*>::iterator it = ToBeModified->begin(), it_e = ToBeModified->end(); it != it_e; ++it) {
+		numData += (*it)->GetNumEl();
+	}
+	if (CFInstance[0].CPUDataValues == NULL) {
+		CFInstance[0].CPUDataValues = new std::vector<ValueType>;
+	}
+	CFInstance[0].CPUDataValues->resize(numData);
+	UpdateCPUDataOffset(&((*CFInstance[0].CPUDataValues)[0]), *ToBeModified, *ToBeModifiedRoot, false);
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+int CostFunction<V, S, G, P>::CreateCPUMemoryForData(i2t<false>) {
+	size_t numData = 0;
+	typename std::vector<Data<NodeType>*>* ToBeModified;
+	std::vector<bool>* ToBeModifiedRoot;
+	if (ToBeFilled->dataClasses != NULL) {
+		ToBeModified = ToBeFilled->dataClasses;
+		ToBeModifiedRoot = ToBeFilled->DataClassesRoot;
+	} else {
+		ToBeModified = CFInstance[0].dataClasses;
+		ToBeModifiedRoot = CFInstance[0].DataClassesRoot;
+	}
+	for (typename std::vector<Data<NodeType>*>::iterator it = ToBeModified->begin(), it_e = ToBeModified->end(); it != it_e; ++it) {
+		numData += (*it)->GetNumEl();
+	}
+	if (ToBeFilled->CPUDataValues == NULL) {
+		ToBeFilled->CPUDataValues = new std::vector<ValueType>;
+	}
+	ToBeFilled->CPUDataValues->resize(numData);
+	UpdateCPUDataOffset(&((*ToBeFilled->CPUDataValues)[0]), *ToBeModified, *ToBeModifiedRoot, false);
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+int CostFunction<V, S, G, P>::CreateCPUMemoryForFunctions(i2t<true>) {
+	size_t numData = 0;
+	typename std::vector<ComputeFunction<NodeType>*>* ToBeModified;
+	std::vector<bool>* ToBeModifiedRoot;
+	if (ToBeFilled->functionClasses != NULL) {
+		ToBeModified = ToBeFilled->functionClasses;
+		ToBeModifiedRoot = ToBeFilled->FunctionClassesRoot;
+	} else {
+		ToBeModified = CFInstance[0].functionClasses;
+		ToBeModifiedRoot = CFInstance[0].FunctionClassesRoot;
+	}
+	std::vector<bool>::iterator isRoot = ToBeModifiedRoot->begin();
+	for (typename std::vector<ComputeFunction<NodeType>*>::iterator it = ToBeModified->begin(), it_e = ToBeModified->end(); it != it_e; ++it, ++isRoot) {
+		if (*isRoot) {
+			numData += (*it)->GetNumEl();
+		}
+	}
+	if (CFInstance[0].CPUFunctionValues == NULL) {
+		CFInstance[0].CPUFunctionValues = new std::vector<ValueType>;
+	}
+	CFInstance[0].CPUFunctionValues->resize(numData);
+	UpdateCPUDataOffset(&((*CFInstance[0].CPUFunctionValues)[0]), *ToBeModified, *ToBeModifiedRoot, true);
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+int CostFunction<V, S, G, P>::CreateCPUMemoryForFunctions(i2t<false>) {
+	size_t numData = 0;
+	typename std::vector<ComputeFunction<NodeType>*>* ToBeModified;
+	std::vector<bool>* ToBeModifiedRoot;
+	if (ToBeFilled->functionClasses != NULL) {
+		ToBeModified = ToBeFilled->functionClasses;
+		ToBeModifiedRoot = ToBeFilled->FunctionClassesRoot;
+	} else {
+		ToBeModified = CFInstance[0].functionClasses;
+		ToBeModifiedRoot = CFInstance[0].FunctionClassesRoot;
+	}
+	for (typename std::vector<ComputeFunction<NodeType>*>::iterator it = ToBeModified->begin(), it_e = ToBeModified->end(); it != it_e; ++it) {
+		numData += (*it)->GetNumEl();
+	}
+	if (ToBeFilled->CPUFunctionValues == NULL) {
+		ToBeFilled->CPUFunctionValues = new std::vector<ValueType>;
+	}
+	ToBeFilled->CPUFunctionValues->resize(numData);
+	UpdateCPUDataOffset(&((*ToBeFilled->CPUFunctionValues)[0]), *ToBeModified, *ToBeModifiedRoot, false);
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+int CostFunction<V, S, G, P>::CreateCPUMemoryForParameters() {
+	assert(DoPrefetch == false);
+	paramPtr->CreateCPUMemoryForParameters();
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+std::vector<typename CostFunction<V, S, G, P>::GraphType>* CostFunction<V, S, G, P>::CreateGraph() {
+	ToBeFilled->graph = new std::vector<GraphType>;
+	return ToBeFilled->graph;
+}
+
+template <typename V, typename S, bool G, bool P>
+std::vector<std::vector<typename CostFunction<V, S, G, P>::ValueType> >* CostFunction<V, S, G, P>::CreateMessageContainer() {
+	ToBeFilled->MessageContainer = new std::vector<std::vector<ValueType> >;
+	return ToBeFilled->MessageContainer;
+}
+
+template <typename V, typename S, bool G, bool P>
+std::vector<typename CostFunction<V, S, G, P>::GraphType>* CostFunction<V, S, G, P>::CreateLoss() {
+	ToBeFilled->loss = new std::vector<GraphType>;
+	return ToBeFilled->loss;
+}
+
+template <typename V, typename S, bool G, bool P>
+std::vector<std::map<size_t, std::vector<typename CostFunction<V, S, G, P>::ValueType> > >* CostFunction<V, S, G, P>::CreateObservations() {
+	ToBeFilled->obs = new std::vector<std::map<size_t, std::vector<typename NodeType::ValueType> > >;
+	return ToBeFilled->obs;
+}
+
+template <typename V, typename S, bool G, bool P>
+int CostFunction<V, S, G, P>::PrepareComputation() {
+	ValueType* baseDataPtr = &(CFInstance[0].CPUDataValues->at(0));
+	CopyDataToGPU(typename NodeType::GPUType(), baseDataPtr, true);
+	AdjustComputationPointers(baseDataPtr, *CFInstance[0].dataClasses, *CFInstance[0].DataClassesRoot, &GPUDataValuesRootOffset);
+	
+	ValueType* baseFunctionPtr = &(CFInstance[0].CPUFunctionValues->at(0));
+	CreateGPUFunctionData(typename NodeType::GPUType(), baseFunctionPtr);
+	AdjustComputationPointers(baseFunctionPtr, *CFInstance[0].functionClasses, *CFInstance[0].FunctionClassesRoot, &GPUFunctionValuesRootOffset);
+
+	if (isMyParamPtr) {
+		paramPtr->PrepareComputation(purpose);
+	}
+
+	if (purpose == TRAIN) {
+		CreateCPUDerivativeMemoryForFunctions();
+		ValueType* baseFunctionDerivativePtr = NULL;
+		ValueType* FunctionRootOffset = NULL;
+		if (CPUFunctionDerivative.size() > 0) {
+			baseFunctionDerivativePtr = &CPUFunctionDerivative[0];
+			FunctionRootOffset = baseFunctionDerivativePtr + ComputeRootFunctionOffset(typename NodeType::GPUType(), GPUFunctionValuesRootOffset);
+		}
+		CreateGPUDerivativeMemoryForFunctions(typename NodeType::GPUType(), baseFunctionDerivativePtr);
+		AdjustDerivativePointers(baseFunctionDerivativePtr, *CFInstance[0].functionClasses, *CFInstance[0].FunctionClassesRoot, FunctionRootOffset);
+	}
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+size_t CostFunction<V, S, G, P>::ComputeRootFunctionOffset(i2t<true>, size_t) {
+	return 0;
+}
+
+template <typename V, typename S, bool G, bool P>
+size_t CostFunction<V, S, G, P>::ComputeRootFunctionOffset(i2t<false>, size_t val) {
+	return val;
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CreateGPUDerivativeMemoryForFunctions(i2t<true>, ValueType*& baseDataPtr) {
+	size_t numData = 0;
+	for (typename std::vector<ComputeFunction<NodeType>*>::iterator it = CFInstance[0].functionClasses->begin(), it_e = CFInstance[0].functionClasses->end(); it != it_e; ++it) {
+		numData += (*it)->GetNumEl();
+	}
+	if (GPUFunctionDerivative != NULL) {
+		cudaFree(GPUFunctionDerivative);
+		check_cuda_errors(__FILE__, __LINE__);
+	}
+	cudaMalloc(&GPUFunctionDerivative, numData*sizeof(ValueType));
+	check_cuda_errors(__FILE__, __LINE__);
+	baseDataPtr = GPUFunctionDerivative;
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CreateGPUDerivativeMemoryForFunctions(i2t<false>, ValueType*&) {}
+
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CreateCPUDerivativeMemoryForFunctions() {
+	CPUFunctionDerivative.resize(CFInstance[0].CPUFunctionValues->size());
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CreateGPUParameterData(i2t<true>, ValueType*& baseDataPtr) {
+	paramPtr->CreateGPUParameterData(typename NodeType::GPUType(), baseDataPtr);
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CreateGPUParameterData(i2t<false>, ValueType*&) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CreateGPUFunctionData(i2t<true>, ValueType*& baseDataPtr) {
+	size_t numData = 0;
+	for (typename std::vector<ComputeFunction<NodeType>*>::iterator it = CFInstance[0].functionClasses->begin(), it_e = CFInstance[0].functionClasses->end(); it != it_e; ++it) {
+		numData += (*it)->GetNumEl();
+	}
+	if (GPUFunctionValues != NULL) {
+		cudaFree(GPUFunctionValues);
+		check_cuda_errors(__FILE__, __LINE__);
+	}
+	cudaMalloc(&GPUFunctionValues, numData*sizeof(ValueType));
+	//std::cout << "Allocating " << numData*sizeof(ValueType) << " bytes." << std::endl;
+	check_cuda_errors(__FILE__, __LINE__);
+	baseDataPtr = GPUFunctionValues;
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CreateGPUFunctionData(i2t<false>, ValueType*&) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyDataToGPU(i2t<true>, ValueType*& baseDataPtr, bool flagNewMemory) {
+	if (flagNewMemory) {
+		if (GPUDataValues != NULL) {
+			cudaFree(GPUDataValues);
+			check_cuda_errors(__FILE__, __LINE__);
+		}
+		cudaMalloc(&GPUDataValues, CFInstance[0].CPUDataValues->size()*sizeof(ValueType));
+		check_cuda_errors(__FILE__, __LINE__);
+	}
+	cudaMemcpy(GPUDataValues, &(*CFInstance[0].CPUDataValues)[0], CFInstance[0].CPUDataValues->size()*sizeof(ValueType), cudaMemcpyHostToDevice);
+	check_cuda_errors(__FILE__, __LINE__);
+	baseDataPtr = GPUDataValues;
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyDataToGPU(i2t<false>, ValueType*&, bool) {}
+
+
+
+
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootFunctionValues(i2t<true>) {
+	if (CFInstance[0].CPUFunctionValues->size() > 0) {
+		cudaMemcpy(&(*CFInstance[0].CPUFunctionValues)[0], GPUFunctionValues + GPUFunctionValuesRootOffset, CFInstance[0].CPUFunctionValues->size()*sizeof(ValueType), cudaMemcpyDeviceToHost);
+		check_cuda_errors(__FILE__, __LINE__);
+	}
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootFunctionValues(i2t<false>) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootDataValues(i2t<true>) {
+	if (CFInstance[0].CPUDataValues->size() > GPUDataValuesRootOffset) {
+		cudaMemcpy(&((*CFInstance[0].CPUDataValues)[0]) + GPUDataValuesRootOffset, GPUDataValues + GPUDataValuesRootOffset, (CFInstance[0].CPUDataValues->size() - GPUDataValuesRootOffset)*sizeof(ValueType), cudaMemcpyDeviceToHost);
+		check_cuda_errors(__FILE__, __LINE__);
+	}
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootDataValues(i2t<false>) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootParameterValues(i2t<true>) {
+	paramPtr->CopyRootParameterValues(typename NodeType::GPUType());
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootParameterValues(i2t<false>) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootFunctionDerivatives(i2t<true>) {
+	if (CPUFunctionDerivative.size() > 0) {
+		cudaMemcpy(GPUFunctionDerivative + GPUFunctionValuesRootOffset, &CPUFunctionDerivative[0], CPUFunctionDerivative.size()*sizeof(ValueType), cudaMemcpyHostToDevice);
+		check_cuda_errors(__FILE__, __LINE__);
+	}
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootFunctionDerivatives(i2t<false>) {}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootParameterDerivatives(i2t<true>) {
+	paramPtr->CopyRootParameterDerivatives(typename NodeType::GPUType());
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::CopyRootParameterDerivatives(i2t<false>) {}
+
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::Update() {
+	paramPtr->Update(ClusterSize);
+}
+
+template <typename V, typename S, bool G, bool P>
+V CostFunction<V, S, G, P>::GetRegularization() {
+	return paramPtr->GetRegularization();
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ResetCPURootFunctionDerivative(i2t<true>) {
+	std::fill(CPUFunctionDerivative.begin(), CPUFunctionDerivative.end(), ValueType(0.0));
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ResetCPURootFunctionDerivative(i2t<false>) {
+	std::fill(CPUFunctionDerivative.begin() + GPUFunctionValuesRootOffset, CPUFunctionDerivative.end(), ValueType(0.0));
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ResetCPURootParameterDerivative(i2t<true>) {
+	paramPtr->ResetCPURootParameterDerivative(i2t<true>());
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ResetCPURootParameterDerivative(i2t<false>) {
+	paramPtr->ResetCPURootParameterDerivative(i2t<false>());
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ResetGradient(i2t<true>) {
+	paramPtr->ResetGradient(typename NodeType::GPUType());
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::ResetGradient(i2t<false>) {
+	paramPtr->ResetGradient(typename NodeType::GPUType());
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::StartPrefetchThread(int iter) {
+	PrefetchResult = std::async(std::launch::async, &CostFunction<V, S, G, P>::PrefetchData, this, iter);
+}
+
+template <typename V, typename S, bool G, bool P>
+bool CostFunction<V, S, G, P>::JoinThread() {
+	return PrefetchResult.get();
+}
+
+template <typename V, typename S, bool G, bool P>
+typename std::vector<typename CostFunction<V, S, G, P>::ValueType>* CostFunction<V, S, G, P>::GetWeights() {
+	return paramPtr->GetWeights(typename NodeType::GPUType());
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::SetWeights(std::vector<ValueType>* weights) {
+	paramPtr->SetWeights(typename NodeType::GPUType(), weights);
+}
+
+template <typename V, typename S, bool G, bool P>
+ParameterContainer<V, S, G, P>* CostFunction<V, S, G, P>::GetParamPtr() {
+	return paramPtr;
+}
+
+template <typename V, typename S, bool G, bool P>
+void CostFunction<V, S, G, P>::SetParamPtr(ParameterContainer<V, S, G, P>* p) {
+	paramPtr = p;
+}
+
+template <typename V, typename S, bool G, bool P>
+typename CostFunction<V, S, G, P>::CFData* CostFunction<V, S, G, P>::GetToBeFilled() {
+	return ToBeFilled;
+}
+
+template class CostFunction<double, int, false, false>;
+template class CostFunction<double, int, true, false>;
+template class CostFunction<float, int, false, false>;
+template class CostFunction<float, int, true, false>;
+
+#define INSTANTIATION_ADDPARAMETER(x) \
+	template x<Node<double, int, false> >* CostFunction<double, int, false, false>::AddParameter<x<Node<double, int, false> > >(SizeType*, SizeType, const x<Node<double, int, false> >::NodeParameters&, bool, int); \
+	template x<Node<double, int, true> >* CostFunction<double, int, true, false>::AddParameter<x<Node<double, int, true> > >(SizeType*, SizeType, const x<Node<double, int, true> >::NodeParameters&, bool, int); \
+	template x<Node<float, int, false> >* CostFunction<float, int, false, false>::AddParameter<x<Node<float, int, false> > >(SizeType*, SizeType, const x<Node<float, int, false> >::NodeParameters&, bool, int); \
+	template x<Node<float, int, true> >* CostFunction<float, int, true, false>::AddParameter<x<Node<float, int, true> > >(SizeType*, SizeType, const x<Node<float, int, true> >::NodeParameters&, bool, int);
+
+#define INSTANTIATION_ADDDATA(x) \
+	template x<Node<double, int, false> >* CostFunction<double, int, false, false>::AddData<x<Node<double, int, false> > >(SizeType*, SizeType, const x<Node<double, int, false> >::NodeParameters&, bool); \
+	template x<Node<double, int, true> >* CostFunction<double, int, true, false>::AddData<x<Node<double, int, true> > >(SizeType*, SizeType, const x<Node<double, int, true> >::NodeParameters&, bool); \
+	template x<Node<float, int, false> >* CostFunction<float, int, false, false>::AddData<x<Node<float, int, false> > >(SizeType*, SizeType, const x<Node<float, int, false> >::NodeParameters&, bool); \
+	template x<Node<float, int, true> >* CostFunction<float, int, true, false>::AddData<x<Node<float, int, true> > >(SizeType*, SizeType, const x<Node<float, int, true> >::NodeParameters&, bool);
+
+#define INSTANTIATION_ADDFUNCTION(x) \
+	template x<Node<double, int, false> >* CostFunction<double, int, false, false>::AddFunction<x<Node<double, int, false> > >(SizeType*, SizeType, const x<Node<double, int, false> >::NodeParameters&, bool); \
+	template x<Node<double, int, true> >* CostFunction<double, int, true, false>::AddFunction<x<Node<double, int, true> > >(SizeType*, SizeType, const x<Node<double, int, true> >::NodeParameters&, bool); \
+	template x<Node<float, int, false> >* CostFunction<float, int, false, false>::AddFunction<x<Node<float, int, false> > >(SizeType*, SizeType, const x<Node<float, int, false> >::NodeParameters&, bool); \
+	template x<Node<float, int, true> >* CostFunction<float, int, true, false>::AddFunction<x<Node<float, int, true> > >(SizeType*, SizeType, const x<Node<float, int, true> >::NodeParameters&, bool);
+
+INSTANTIATION_ADDPARAMETER(Parameters)
+INSTANTIATION_ADDDATA(Data)
+INSTANTIATION_ADDFUNCTION(AffineFunction)
+INSTANTIATION_ADDFUNCTION(ReluFunction)
+INSTANTIATION_ADDFUNCTION(ConvFunction)
+INSTANTIATION_ADDFUNCTION(PoolFunction)
+INSTANTIATION_ADDFUNCTION(LrnFunction)
+INSTANTIATION_ADDFUNCTION(DropoutFunction)

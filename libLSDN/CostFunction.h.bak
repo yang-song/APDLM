@@ -1,0 +1,180 @@
+#ifndef __COSTFUNCTION_H__
+#define __COSTFUNCTION_H__
+#include <thread>
+#include <future>
+
+#include "Node.h"
+#include "UtilityClass.h"
+#include "Parameters.h"
+#include "ParameterContainer.h"
+#include "Data.h"
+#include "ComputeFunction.h"
+#include "ComputationTree.h"
+#include "GMRegion.h"
+
+#include "Function_Affine.h"
+#include "Function_Relu.h"
+#include "Function_Dropout.h"
+#include "Function_Sigmoid.h"
+#include "Function_Softmax.h"
+#include "Function_Pool.h"
+#include "Function_Conv.h"
+#include "Function_Lrn.h"
+
+template <typename V, typename S, bool G, bool P>
+class CostFunction : public UtilityClass<V, S, G, P> {
+public:
+	typedef V ValueType;
+	typedef S SizeType;
+	typedef i2t<P> ParlType;
+	typedef Node<V, S, G> NodeType;
+	typedef Parameters<NodeType> ParaType;
+	typedef Data<NodeType> DataType;
+	typedef ComputeFunction<NodeType> FuncType;
+	typedef ComputationTree<NodeType> CompTree;
+	typedef GMRegion<AccessPotential<NodeType> > RegionType;
+	typedef libRegionBPP<RegionType, P> SolverType;
+	typedef typename SolverType::GraphType GraphType;
+	typedef typename SolverType::GraphNode GraphNode;
+	typedef typename SolverType::MsgContainer MsgContainer;
+
+	typedef typename CompTree::TreePostIter TreePostIter;
+
+	struct CFData {
+		std::vector<GraphType>* graph;
+		std::vector<GraphType>* loss;
+		std::vector<std::map<size_t, std::vector<typename NodeType::ValueType> > >* obs;
+		std::vector<CompTree*>* CompTreeSet;
+		std::vector<std::vector<ValueType> >* MessageContainer;
+
+		std::vector<Data<NodeType>*>* dataClasses;
+		std::vector<bool>* DataClassesRoot;
+		std::vector<ComputeFunction<NodeType>*>* functionClasses;
+		std::vector<bool>* FunctionClassesRoot;
+
+		std::vector<ValueType>* CPUDataValues;
+		std::vector<ValueType>* CPUFunctionValues;
+		CFData() : graph(NULL), loss(NULL), obs(NULL), CompTreeSet(NULL), MessageContainer(NULL), dataClasses(NULL), DataClassesRoot(NULL), functionClasses(NULL), FunctionClassesRoot(NULL), CPUDataValues(NULL), CPUFunctionValues(NULL) {};
+	};
+private:
+	CFData CFInstance[2];
+	CFData* ToBeFilled;
+
+	bool isMyParamPtr;
+	ParameterContainer<V, S, G, P>* paramPtr;
+
+	std::vector<ValueType> CPUFunctionDerivative;
+
+	ValueType* GPUDataValues;
+	ValueType* GPUFunctionValues;
+	ValueType* GPUFunctionDerivative;
+
+	size_t GPUFunctionValuesRootOffset;
+	size_t GPUDataValuesRootOffset;
+
+	bool DoPrefetch;
+	bool UserCopyRequest;
+	std::future<bool> PrefetchResult;
+public:
+	STATE purpose;
+//protected:
+	int ClusterSize;
+	int ClusterID;
+	int MachineLocalSize;
+	int MachineLocalID;
+	bool IInitializedMPI;
+	char* hostnamePtr;
+	size_t hostnameLength;
+public:
+	CostFunction();
+	virtual ~CostFunction();
+
+	virtual bool CreateData(ParameterContainer<V, S, G, P>* paramClasses);
+	virtual bool PrefetchData(int counter);
+	virtual bool PrefetchDataUser(int counter, bool* UserCopyRequest);
+	virtual int SwapData(int counter);
+	virtual void ReduceStepSize();
+	virtual int PrepareComputation();
+	virtual void Clear();
+	virtual void ClearCF(int ix);
+
+	virtual void AdjustAccessPotentials(std::vector<GraphType>* graph, std::vector<CompTree*>* CompTreeSet);
+	virtual void AdjustMessagePointers(std::vector<GraphType>*, std::vector<std::vector<ValueType> >*);
+	virtual void StoreMessages(int counter);
+
+	virtual void CopyDataToGPU(i2t<true>, ValueType*& baseDataPtr, bool flagNewMemory);
+	virtual void CopyDataToGPU(i2t<false>, ValueType*& baseDataPtr, bool flagNewMemory);
+
+	virtual void CreateGPUFunctionData(i2t<true>, ValueType*& baseDataPtr);
+	virtual void CreateGPUFunctionData(i2t<false>, ValueType*& baseDataPtr);
+
+	virtual void CreateGPUParameterData(i2t<true>, ValueType*& baseDataPtr);
+	virtual void CreateGPUParameterData(i2t<false>, ValueType*& baseDataPtr);
+
+	virtual void CreateCPUDerivativeMemoryForFunctions();
+	virtual void CreateGPUDerivativeMemoryForFunctions(i2t<false>, ValueType*& baseDataPtr);
+	virtual void CreateGPUDerivativeMemoryForFunctions(i2t<true>, ValueType*& baseDataPtr);
+
+	template <class I>
+	I* AddParameter(SizeType* sz, SizeType numDim, const typename I::NodeParameters& params, bool isRoot, int paramID);
+	template <class I>
+	I* AddData(SizeType* sz, SizeType numDim, const typename I::NodeParameters& params, bool isRoot);
+	template <class I>
+	I* AddFunction(SizeType* sz, SizeType numDim, const typename I::NodeParameters& params, bool isRoot);
+	virtual int AddComputationTree(CompTree* CNN);
+
+	virtual int CreateCPUMemoryForData(i2t<true>);
+	virtual int CreateCPUMemoryForData(i2t<false>);
+	virtual int CreateCPUMemoryForFunctions(i2t<true>);
+	virtual int CreateCPUMemoryForFunctions(i2t<false>);
+	virtual int CreateCPUMemoryForParameters();
+
+	virtual std::vector<GraphType>* CreateGraph();
+	virtual std::vector<std::vector<ValueType> >* CreateMessageContainer();
+	virtual std::vector<GraphType>* CreateLoss();
+	virtual std::vector<std::map<size_t, std::vector<ValueType> > >* CreateObservations();
+
+	virtual void ClearGraph(std::vector<GraphType>*);
+	virtual void ClearLoss(std::vector<GraphType>*);
+	virtual void ClearComputationTree(std::vector<CompTree*>*);
+
+	template <typename T>
+	void ClearTreeItems(std::vector<T*>*);
+
+	CFData* GetCF();
+	virtual void CopyRootFunctionValues(i2t<true>);
+	virtual void CopyRootFunctionValues(i2t<false>);
+	virtual void CopyRootParameterValues(i2t<true>);
+	virtual void CopyRootParameterValues(i2t<false>);
+	virtual void CopyRootDataValues(i2t<true>);
+	virtual void CopyRootDataValues(i2t<false>);
+
+	virtual void CopyRootFunctionDerivatives(i2t<true>);
+	virtual void CopyRootFunctionDerivatives(i2t<false>);
+	virtual void CopyRootParameterDerivatives(i2t<true>);
+	virtual void CopyRootParameterDerivatives(i2t<false>);
+
+	virtual size_t ComputeRootFunctionOffset(i2t<true>, size_t val);
+	virtual size_t ComputeRootFunctionOffset(i2t<false>, size_t val);
+
+	virtual void Update();
+	virtual ValueType GetRegularization();
+	virtual void ResetGradient(i2t<true>);
+	virtual void ResetGradient(i2t<false>);
+	virtual void ResetCPURootFunctionDerivative(i2t<true>);
+	virtual void ResetCPURootFunctionDerivative(i2t<false>);
+	virtual void ResetCPURootParameterDerivative(i2t<true>);
+	virtual void ResetCPURootParameterDerivative(i2t<false>);
+
+	virtual void StartPrefetchThread(int iter);
+	virtual bool JoinThread();
+
+	virtual std::vector<Data<NodeType>*>* GetComputeDataClasses();
+	virtual ParameterContainer<V, S, G, P>* GetParamPtr();
+	virtual void SetParamPtr(ParameterContainer<V, S, G, P>*);
+	virtual std::vector<ValueType>* GetWeights();
+	virtual void SetWeights(std::vector<ValueType>* weights);
+	virtual CFData* GetToBeFilled();
+};
+
+#endif

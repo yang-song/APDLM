@@ -1,0 +1,54 @@
+#ifndef __SOLVERNEW_H__
+#define __SOLVERNEW_H__
+
+#include "CostFunction.h"
+
+template <class C=CostFunction<double,int,false,false> >
+class Solver {
+public:
+	typedef C CostFunType;
+	typedef typename C::ValueType ValueType;
+	typedef typename C::SizeType SizeType;
+	typedef typename C::GraphType GraphType;
+	typedef typename C::NodeType NodeType;
+	typedef typename C::CompTree CompTree;
+	typedef typename C::SolverType SolverType;
+
+	struct SolverParameters {
+		size_t MPIterations;
+		size_t ValidationMPIterations;
+		char* InitWeights;
+		int Iterations;
+		int ValidationInterval;
+		int InitReductionAttempts;
+		int NormalReductionAttempts;
+		int AveragingSize;
+		int LossForAveraging;
+		int ReductionCheckInterval;
+		int Top5Loss;
+		int PrintFrequency;
+		int SnapshotFrequency;
+		SolverParameters() : MPIterations(10), ValidationMPIterations(10), InitWeights(NULL), Iterations(10), ValidationInterval(1000), InitReductionAttempts(1), NormalReductionAttempts(7), AveragingSize(6), LossForAveraging(0), ReductionCheckInterval(1), Top5Loss(0), PrintFrequency(1), SnapshotFrequency(1000) {}
+	};
+private:
+	size_t NumberStepSizeReductions;
+	size_t ReductionAttempt;
+	SolverParameters* params;
+
+	virtual ValueType GradientComputation(int iter, CostFunType* Train, bool WithBackwardPass);
+	virtual void GradientUpdateAndReset(CostFunType* Train);
+	virtual ValueType ComputeLoss(CostFunType* Valid);
+	virtual int ComputePrediction(CostFunType* Test, std::vector<ValueType>& Scores, std::vector<std::map<size_t, std::vector<ValueType> > >& Beliefs);
+	virtual bool ReduceStepSize(std::vector<ValueType>&, size_t, bool);
+
+	virtual void LoadWeights(CostFunType* CF);
+public:
+	Solver(SolverParameters& params);
+	virtual ~Solver();
+
+	virtual void CheckDerivative(CostFunType* Train, std::vector<ValueType>* weights, ValueType h);
+	virtual int Iterate(CostFunType* Train, CostFunType* Valid);
+	virtual int Predict(CostFunType* Test, std::vector<ValueType>* weights, std::vector<ValueType>& Scores, std::vector<std::map<size_t, std::vector<ValueType> > >& Beliefs);
+};
+
+#endif
