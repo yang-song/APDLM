@@ -44,4 +44,4 @@ Here `alpha` is the learning rate, `beta` is the L2 regularization coefficient, 
 
 ### Notes
 
-The AlexNet weight `AlexNetWeightsSingleDimensionOutput.dat` used for finetuning is too large for GitHub. Please contact the authors for it.
+The AlexNet weight `AlexNetWeightsSingleDimensionOutput.dat` used for finetuning is available at this [Google drive](https://drive.google.com/file/d/1wRiDvwVJGR00ZwaWSW5MvavZIxfi81Dl/view?usp=sharing).
